@@ -1,167 +1,209 @@
 # nim-code
 
-**A Claude Code plugin that makes agent work on both Nim and Nimony codebases dramatically more token-efficient.**
+A Claude Code plugin that mediates agent access to the **Nim** and **Nimony**
+toolchains through structured tools, so an agent works from compact diagnostics,
+outlines, and targeted NIF slices instead of raw compiler output and multi‑hundred‑kilobyte
+S‑expression artifacts.
 
-Nim and [Nimony](https://github.com/nim-lang/nimony) (the new NIF-based Nim reimplementation) generate a lot of text that is expensive to feed through an agent verbatim: enormous `.nif` S-expression artifacts, noisy compiler chatter, and giant test diffs. `nim-code` puts a thin, structured layer between Claude and both toolchains so the agent sees compact diagnostics and targeted slices of NIF instead of megabytes of raw output.
+The plugin supports both toolchains from a single interface: the same commands
+and tools operate on Nim (`nim`, `nimsuggest`, `nimble`) and on
+[Nimony](https://github.com/nim-lang/nimony), the NIF‑based Nim reimplementation
+(`nimony`, `nimsem`, `hastur`, and the `nimcache/*.nif` artifacts its pipeline
+emits). Toolchain selection is automatic and overridable.
 
----
+## Contents
 
-## Why
+- [Motivation](#motivation)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Toolchain detection](#toolchain-detection)
+- [Components](#components)
+- [MCP tool reference](#mcp-tool-reference)
+- [Terse mode](#terse-mode)
+- [Hooks](#hooks)
+- [Commands](#commands)
+- [Skills and subagents](#skills-and-subagents)
+- [Examples](#examples)
+- [Requirements](#requirements)
+- [Design notes](#design-notes)
+- [Changelog](#changelog)
 
-On a bare Claude Code session, these codebases bleed tokens in predictable places:
+## Motivation
 
-- **Huge `.nif` S-expr artifacts.** A single lowered NIF file in `nimcache/` is routinely 160 KB / ~5,500 lines of parenthesized S-expression. `Read`-ing one to answer a small question burns tens of thousands of tokens.
-- **Verbose, noisy compiler output.** `nimony c` / `hastur` wrap real diagnostics in `nifmake:`, `FAILURE:`, and `niflink` chatter. The signal (the actual `Error:` lines) is a few lines buried in screens of build logging.
-- **`nimony c` returns exit 0 on failure.** The agent cannot trust the exit code — a build that errored still looks "successful," so it re-reads output (more tokens) or, worse, proceeds on a broken assumption.
-- **Giant NIF test diffs.** Nimony's tests embed produced NIF, so `hastur --overwrite` diffs are thousands of lines of S-expr. Reviewing them as raw `git diff` is enormous.
-- **A 123k-line codebase.** Grepping and re-reading source to locate a symbol's definition and uses, by hand, adds up fast.
-- **Re-learning the tag vocabulary every session.** `doc/tags.md` (the NIF tag reference) gets re-read from scratch each time the agent touches NIF.
-- **Conflating Nim and Nimony.** They share syntax but not feature sets or toolchains (`nim` vs `nimony`, `nimble` vs `hastur`). An agent that assumes "Nim 2" semantics on a Nimony file wastes turns on wrong answers.
+Both toolchains produce output that is costly to pass through an agent verbatim.
+The plugin targets six recurring sources of token waste:
 
-`nim-code` addresses each of these directly: NIF is only ever read through targeted tools, build output is trimmed to diagnostics, failure is detected by parsing (not exit code), diffs are collapsed structurally, symbol lookup is one tool call, and the tag vocabulary plus the Nim-vs-Nimony distinction ship as skills.
+| Source | Cost | Mitigation |
+|--------|------|------------|
+| NIF artifacts in `nimcache/` | A single lowered `.nif` is commonly 160 KB–700 KB of parenthesized S‑expression. | NIF is read only through `nif_outline`/`nif_query`/`nif_diff`/`nif_render`; direct reads are intercepted by hooks. |
+| Noisy compiler output | `nimony c` / `hastur` interleave `nifmake:`, `FAILURE:`, and `niflink` lines with real diagnostics. | `compile` parses diagnostics; a `PostToolUse` hook strips the noise from ad‑hoc build commands. |
+| `nimony c` exits 0 on failure | The exit code is unreliable, so failure is easy to miss. | Failure is determined by parsing for an `Error:` diagnostic, not by exit status. |
+| Large NIF test diffs | `hastur --overwrite` diffs embed produced NIF and run to thousands of lines. | `nif_diff` collapses unchanged regions to a structural diff. |
+| Symbol lookup across a large tree | Locating a definition and its uses by grep is repetitive and unbounded. | `symbols` (name search) and `defs_uses` (position‑based) return structured results in one call. |
+| Repeated context loss | The NIF tag vocabulary and the Nim/Nimony distinction are re‑derived each session. | Shipped as on‑demand skills; a project map is maintained in persistent memory. |
 
----
+## Installation
 
-## Architecture
+The plugin is loaded from this directory; nothing is published to a registry.
+
+Per session:
+
+```bash
+claude --plugin-dir /home/savant/nimony-code
+```
+
+Persistent, via a local marketplace:
+
+```text
+/plugin marketplace add /home/savant/nimony-code
+/plugin install nim-code
+```
+
+Enabling the plugin auto‑registers the `nimlang` MCP server and activates all
+hooks. Run `/reload-plugins` after editing plugin files to reload without
+restarting. Commands are namespaced under the plugin — `/nim-code:check`,
+`/nim-code:nif`, and so on — and listed by `/help`.
+
+## Configuration
+
+All configuration is via environment variables; none is required.
+
+| Variable | Effect | Default |
+|----------|--------|---------|
+| `NIMLANG_TOOLCHAIN` | Forces `nim` or `nimony` for every call. | unset (auto‑detect) |
+| `NIM_BIN_DIR` | Directory holding `nim`, `nimsuggest`, `nimble`. | `PATH`, then `~/Nim/bin` |
+| `NIMONY_BIN_DIR` | Directory holding `nimony`, `nimsem`, `hastur`. | `PATH`, then `~/nimony/bin` |
+| `NIMLANG_AGGRESSIVE` | When truthy, every tool defaults to [terse](#terse-mode) output. | unset (verbose) |
+
+Binaries resolve from `PATH` first, then the corresponding directory.
+
+## Toolchain detection
+
+With `toolchain="auto"` (the default on every tool that takes it), the server
+walks up from the target file's directory. It selects Nimony if it finds a
+`nimony.paths`, a `nimony.cfg`, or a `nim.cfg` referencing nimony; otherwise Nim.
+`NIMLANG_TOOLCHAIN` overrides detection globally, and an explicit `toolchain`
+argument overrides it per call.
+
+## Components
 
 ```
-nim-code/                      ${CLAUDE_PLUGIN_ROOT}
-├── .claude-plugin/
-│   └── plugin.json               manifest (name, version 0.1.0, author)
+nim-code/                         ${CLAUDE_PLUGIN_ROOT}
+├── .claude-plugin/plugin.json    manifest
 ├── .mcp.json                     registers the `nimlang` MCP server
 ├── mcp/
-│   ├── server.py                 zero-dependency MCP server (stdlib Python 3.7)
-│   ├── test_server.py            starts server, checks a bad Nim + bad Nimony file
-│   └── README.md                 manual nimsuggest / idetools fallback notes
+│   ├── server.py                 MCP server — stdlib-only Python 3.7, zero dependencies
+│   ├── test_server.py            self-test: exercises all tools against live nim/nimony
+│   └── README.md                 manual nimsuggest / nimsem fallback notes
 ├── hooks/
-│   ├── hooks.json                wires the hooks below
-│   ├── guard-nif-read.py         PreToolUse(Read): transform big .nif reads into an outline (v0.2)
-│   ├── guard-nif-bash.py         PreToolUse(Bash): block cat/head of big .nif (v0.2)
-│   └── trim-build-output.py      PostToolUse(Bash): strip build noise
-├── commands/
-│   ├── check.md                  /check [file]
-│   ├── nif.md                    /nif <file.nif> [needle]
-│   ├── phase-diff.md             /phase-diff <file.nim>
-│   ├── nimony-bug.md             /nimony-bug [file]
-│   ├── explain-failure.md        /explain-failure [file]           (v0.2)
-│   ├── shrink.md                 /shrink [file]                    (v0.2)
-│   ├── render.md                 /render <file.nif> [needle]       (v0.2)
-│   └── aggressive.md             /aggressive [on|off]              (v0.2)
-├── skills/
-│   ├── nif-format/SKILL.md       condensed NIF tag vocab + phase pipeline
-│   ├── nim-vs-nimony/SKILL.md    feature/toolchain differences
-│   ├── debug-loop/SKILL.md       the AGENTS.md compiler debug workflow
-│   └── token-thrift/SKILL.md     prefer recipe tools + terse mode (v0.2)
-└── agents/
-    ├── nif-inspector.md          subagent for heavy NIF reading
-    └── nim-fixer.md              cheap-model fix-loop subagent, returns only a diff (v0.2)
+│   ├── hooks.json                hook wiring
+│   ├── guard-nif-read.py         PreToolUse(Read)  — intercept large .nif reads
+│   ├── guard-nif-bash.py         PreToolUse(Bash)  — intercept .nif dumps
+│   └── trim-build-output.py      PostToolUse(Bash) — strip build noise
+├── commands/                     10 slash commands (see Commands)
+├── skills/                       5 skills (see Skills and subagents)
+└── agents/                       2 subagents (see Skills and subagents)
 ```
 
-**The `nimlang` MCP server** (`mcp/server.py`) is the core. It speaks JSON-RPC 2.0 over stdio, shells out to the right compiler/tools, and returns a single compact structured block per call — never a whole NIF file. It auto-detects the toolchain by walking up from the target file (a `nimony.paths` / `nimony.cfg` / nimony-flavored `nim.cfg` means Nimony, otherwise Nim), overridable via the `toolchain` argument or `NIMLANG_TOOLCHAIN`.
+The `nimlang` MCP server is the core. It speaks JSON‑RPC 2.0 over stdio, shells
+out to the appropriate toolchain, and returns one compact structured block per
+call. It never returns a whole NIF file.
 
-**3 hooks** keep raw noise out of the context window automatically:
-- `guard-nif-read.py` (PreToolUse on `Read`) denies reading a `.nif` file over 15 KB — and, as of v0.2, transforms the denial into a compact outline in the same turn (see [Aggressive mode](#aggressive-mode-v02)).
-- `guard-nif-bash.py` (PreToolUse on `Bash`, **v0.2**) blocks `cat`/`head`/`tail` etc. of a big `.nif`, closing the shell-level loophole around the Read guard.
-- `trim-build-output.py` (PostToolUse on `Bash`) strips `nifmake:` / `FAILURE:` / `niflink` lines from `nimony`/`hastur`/`nim c`/`nimble` output and surfaces just the diagnostics.
+## MCP tool reference
 
-**10 slash commands**: `/check`, `/nif`, `/phase-diff`, `/nimony-bug`, the v0.2 additions `/explain-failure`, `/shrink`, `/render`, `/aggressive`, and the navigation commands `/api`, `/symbols` (see below).
+Twelve tools are exposed by the `nimlang` server. `compile`, `outline`,
+`defs_uses`, `explain_failure`, `phase_report`, `shrink`, `api`, and `symbols`
+support both toolchains. The `nif_*` tools operate on Nimony NIF artifacts and
+are Nimony‑only. Every tool accepts `terse` (see [Terse mode](#terse-mode)).
 
-**5 skills**: `nif-format`, `nim-vs-nimony`, `debug-loop`, the v0.2 `token-thrift`, and `repo-map` — loaded on demand so the agent doesn't re-read `doc/tags.md`, re-derive toolchain differences, re-outline files, or forget the cheap path each session.
+| Tool | Signature | Result / behavior | Toolchains |
+|------|-----------|-------------------|------------|
+| `compile` | `(file, toolchain="auto", extra_args=[])` | Runs `nim check` or `nimony c`, parses diagnostics, and reports `ok` by the presence of an `Error:` line rather than the exit code. Returns `{ok, toolchain, stage, diagnostics}`. | both |
+| `outline` | `(file, toolchain="auto")` | Top‑level symbols `{name, kind, line, col}`. Nim via `nimsuggest outline`; Nimony (and the Nim fallback) via a source regex scan. | both |
+| `defs_uses` | `(file, line, col, toolchain="auto")` | Definition and uses of the symbol at a position: `{def, uses}`. Nim via `nimsuggest def`/`use`; Nimony via `nimsem --def:FILE,LINE,COL idetools` and `--usages:` against the module's `.s.nif` in `nimcache`. Degrades to `{error, hint}` if the artifact is absent. | both |
+| `explain_failure` | `(file, toolchain="auto")` | Compiles and, on failure, returns a short `verdict` and a `culprit`. Nimony extracts the smallest NIF node spanning the error position from the phase artifact; Nim returns ±3 source lines around the first error. Collapses the compile → outline → query sequence into one call. | both |
+| `phase_report` | `(file, toolchain="auto")` | Compiles, then summarizes each `nimcache/*.<phase>.nif` (p, s, …) in one line (top tag counts and size), with no raw NIF. Nim returns an empty phase list with a note. | both |
+| `shrink` | `(file, toolchain="auto")` | Delta‑debugs a failing file, dropping top‑level statements while the first `Error:` message is preserved. Returns `{original_lines, minimal_lines, minimal_source, kept_error}`. Iteration‑ and time‑bounded. | both |
+| `api` | `(module, toolchain="auto", needle=None)` | Typed public API of a module or dependency without reading its source. Nim runs `nim jsondoc` on a `.nim` path, an installed nimble package (e.g. `chroma`), or a stdlib module (e.g. `std/tables`), returning `{name, kind, sig}` entries. For a `.nif`/Nimony target the typed API is the compiled artifact, rendered via `nif_render`. `needle` filters by name substring. | both |
+| `symbols` | `(name, root=".", kind=None, uses=false)` | Project‑wide symbol search by name substring; regex‑based and toolchain‑agnostic. Returns `{defs, root}`, and `{uses}` when `uses:true`. Skips `nimcache`, `.git`, `htmldocs`, and nimble dirs; bounded for large trees. | both |
+| `nif_outline` | `(nif_file)` | Top‑level `(tag name …)` nodes of a NIF artifact — names only, no bodies. | Nimony |
+| `nif_query` | `(nif_file, needle)` | S‑expr subtrees whose head tag or symbol matches `needle`, each snippet truncated, via a paren‑matching scanner. | Nimony |
+| `nif_render` | `(nif_file, needle=None)` | Renders NIF node(s) as compact pseudo‑Nim (`proc`/`var`/`let`/`call`/`if`/`type`/… mapped to Nim‑like syntax; `sym.NN.mod` demangled to `sym`), falling back to a raw snippet for unknown tags. Roughly an order of magnitude smaller than raw NIF. | Nimony |
+| `nif_diff` | `(file_a, file_b)` | Structural/line diff between two NIF files (unified diff, context 1, unchanged regions collapsed). | Nimony |
 
-**2 subagents**: `nif-inspector` — does heavy NIF / phase-artifact reading in its own context and returns only the conclusion, keeping large S-expr out of the main thread (handles both Nim source and Nimony NIF); and the v0.2 `nim-fixer` — runs the fix loop on a cheap model in its own context and returns only the final diff.
+## Terse mode
 
----
+Every tool accepts an optional `terse` boolean, defaulting to the truthiness of
+`NIMLANG_AGGRESSIVE`. Terse output collapses to the smallest useful shape and
+drops warnings and hints; verbose shapes are unchanged, so the flag is
+back‑compatible and opt‑in.
 
-## MCP tools
+| Tool | Terse shape |
+|------|-------------|
+| `compile` | `diagnostics` become `"file:line:col msg"` strings; warnings/hints dropped; `ok` kept. |
+| `outline` | `["name:line", …]` |
+| `defs_uses` | `{def: "file:line" \| null, uses: ["file:line", …]}` |
+| `symbols` | `{defs: ["file:line kind name", …], uses: ["file:line", …]}` |
+| `api` | `api` becomes a list of bare signature strings. |
+| `nif_query` / `nif_outline` / `nif_render` | Tighter per‑snippet caps (~15 lines); null fields omitted. |
 
-All twelve are exposed by the `nimlang` server. `compile`, `outline`, `defs_uses`, `explain_failure`, `phase_report`, `shrink`, `api`, and `symbols` work for **both** toolchains; the `nif_*` tools (including `nif_render`) operate on Nimony's NIF artifacts and are **Nimony-only** (`api` on a Nimony/`.nif` target renders the NIF equivalent). The last four tools are new in v0.2 — see [Aggressive mode](#aggressive-mode-v02).
+`/aggressive [on|off]` documents enabling terse mode and its trade‑offs.
 
-| Tool | What it does | Toolchain(s) |
-|------|--------------|--------------|
-| `compile(file, toolchain="auto", extra_args=[])` | Runs the correct checker (`nim check` or `nimony c`), parses diagnostics, and reports a **correct** ok/fail by treating any `Error:` line as failure (not the unreliable exit code). Returns `{ok, toolchain, stage, diagnostics:[…]}`. | Nim **and** Nimony |
-| `outline(file, toolchain="auto")` | Lists top-level symbols `{name, kind, line, col}`. Nim uses `nimsuggest outline`; Nimony (and the Nim fallback) uses a regex scan of the `.nim` source. | Nim **and** Nimony |
-| `nif_outline(nif_file)` | Top-level `(tag name …)` nodes of a NIF artifact — names only, no bodies. Lets the agent map a 5,500-line file in a few hundred tokens. | Nimony only |
-| `nif_query(nif_file, needle)` | Returns only the S-expr subtrees whose head tag or symbol matches `needle`, each snippet truncated to ~40 lines, via a paren-matching scanner. | Nimony only |
-| `nif_diff(file_a, file_b)` | Compact structural/line diff between two NIF files (unified diff, context=1, unchanged regions collapsed). Turns a thousand-line raw diff into the parts that actually changed. | Nimony only |
-| `defs_uses(file, line, col, toolchain="auto")` | Definition + all uses of the symbol at a position: `{def, uses:[…]}`. Nim via `nimsuggest def`/`use`; Nimony via `nimsem idetools --track` against the `.s.nif` in `nimcache` (best-effort, degrades gracefully). | Nim **and** Nimony |
-| `explain_failure(file, toolchain="auto", terse=…)` **(v0.2)** | **Recipe tool.** Compiles and, on failure, returns a ≤5-line `verdict` plus a `culprit`: Nimony extracts the smallest NIF node spanning the error position from the phase artifact; Nim returns ±3 source lines around the first error. One call replaces the manual compile → list → outline → query sequence. | Nim **and** Nimony |
-| `phase_report(file, toolchain="auto", terse=…)` **(v0.2)** | **Recipe tool.** Compiles, then for each `nimcache/*.<phase>.nif` (p, s, …) gives a 1-line summary (top tag counts + size) with **no raw NIF**. Nim returns `{ok, phases:[], note:"Nim C backend has no NIF phases"}`. | Nim **and** Nimony |
-| `nif_render(nif_file, needle=None, terse=…)` **(v0.2)** | Renders matching NIF node(s) as compact **pseudo-Nim** (maps `proc`/`var`/`let`/`const`/`call`/`if`/`asgn`/`ret`/`type`/… to Nim-ish syntax, demangles `sym.NN.mod` → `sym`), falling back to a raw snippet for unknown tags. ~10× smaller than raw NIF. | Nimony only |
-| `shrink(file, toolchain="auto")` **(v0.2)** | Delta-debugs a failing file: iteratively drops top-level statements/lines while the **first** `Error:` message is preserved, returning `{original_lines, minimal_lines, minimal_source, kept_error}` — the minimal still-failing repro. Iteration/time bounded. | Nim **and** Nimony |
-| `api(module, toolchain="auto", needle=None, terse=…)` | Returns the **typed public API** of a module or third-party package **without reading its source**. Nim runs `nim jsondoc` on a `.nim` path, a nimble package name (e.g. `chroma`), or a stdlib module (e.g. `std/tables`) and returns `{toolchain, module, source, api:[{name, kind, sig}]}`. `needle` filters by name substring; terse collapses `api` to compact signature strings. | Nim (via `nim jsondoc`) |
-| `api(module, …)` on a `.nif` / Nimony target | The typed API **is** the compiled artifact: renders the `.nif` via `nif_render`, or returns a note to compile first and then use `nif_render`/`nif_outline`. | Nimony (`.nif`) |
-| `symbols(name, root=".", kind=None, uses=false, terse=…)` | Project-wide symbol search by **name substring**, regex-based and toolchain-agnostic — replaces raw `grep` for "where is X defined/used". Returns `{defs:[{name,kind,file,line}], root}`, plus `{uses:[{file,line}]}` when `uses:true`. Terse collapses to `defs:["file:line kind name"]`, `uses:["file:line"]`. | Nim **and** Nimony |
+## Hooks
 
----
+Three hooks keep raw output out of the context window without agent involvement.
+All are stdlib‑only Python and fail open (any error exits 0, never blocking the
+tool).
 
-## Aggressive mode (v0.2)
+| Hook | Event / matcher | Behavior |
+|------|-----------------|----------|
+| `guard-nif-read.py` | PreToolUse / `Read` | Denies reading a `.nif` over 15 KB, and attaches a compact `nif_outline` of the file to the denial reason so the agent receives the useful form in the same turn. |
+| `guard-nif-bash.py` | PreToolUse / `Bash` | Denies `cat`/`head`/`tail`/`less`/`more`/`bat` targeting a `.nif` over 15 KB — the shell path around the `Read` guard — and points to the NIF tools. No‑op otherwise. |
+| `trim-build-output.py` | PostToolUse / `Bash` | For `nimony`/`hastur`/`nim c`/`nimble` commands, strips `nifmake:`/`FAILURE:`/`niflink` lines and surfaces the diagnostics as additional context. No‑op otherwise. |
 
-v0.2 adds an aggressive token-saving layer on top of everything above: a **terse** output mode on every tool, four new tools (two of them "recipe" tools that collapse whole workflows into one call), a Bash guard, a transform-not-block upgrade to the Read guard, four commands, a cheap-model subagent, and a behavior-shaping skill. All of it works for **both** Nim and Nimony (except `nif_render`, which is Nimony-only).
+The `Read` hook illustrates the plugin's preferred pattern: rather than only
+blocking a wasteful action, it supplies the cheap alternative in the same
+response.
 
-### Terse mode
+## Commands
 
-Every tool — old and new — accepts an optional `terse: bool`. It defaults to the truthiness of the `NIMLANG_AGGRESSIVE` environment variable, so exporting `NIMLANG_AGGRESSIVE=1` (or running `/aggressive on`) makes every call terse by default; you can still force it per call with `terse: true`.
+| Command | Tool | Purpose |
+|---------|------|---------|
+| `/check [file]` | `compile` | Compile and report structured diagnostics. |
+| `/explain-failure [file]` | `explain_failure` | One‑call "why did this fail," with the culprit. |
+| `/shrink [file]` | `shrink` | Minimal still‑failing reproduction. |
+| `/api <module> [needle]` | `api` | Typed API of a module or dependency. |
+| `/symbols <name>` | `symbols` | Project‑wide symbol search. |
+| `/nif <file.nif> [needle]` | `nif_outline` / `nif_query` | Outline or query a NIF artifact. |
+| `/render <file.nif> [needle]` | `nif_render` | Pseudo‑Nim view of a NIF node. |
+| `/phase-diff <file.nim>` | `nif_diff` | Diff a file's NIF phase artifacts. |
+| `/nimony-bug [file]` | — | Run the Nimony compiler debug loop and report only diagnostics. |
+| `/aggressive [on\|off]` | — | Explain and toggle terse mode. |
 
-When terse, output collapses to the smallest useful shape and warnings/hints are dropped:
+## Skills and subagents
 
-- `compile` → drops `Warning`/`Hint`; diagnostics become bare `"file:line:col msg"` strings; `ok` is kept.
-- `outline` → `["name:line", …]`.
-- `defs_uses` → `{def:"file:line"|null, uses:["file:line", …]}`.
-- `nif_query` / `nif_outline` / `nif_render` → tighter caps (~15 lines per snippet) and null fields omitted.
+Skills load on demand; subagents run in their own context and return only a
+conclusion.
 
-Non-terse output shapes are unchanged, so terse mode is fully back-compatible — it is purely opt-in.
+| Skill | Purpose |
+|-------|---------|
+| `nif-format` | Condensed NIF tag vocabulary and the nifler → nimony → hexer → lengc pipeline; points to `doc/tags.md` for the long tail. |
+| `nim-vs-nimony` | Feature‑set and toolchain differences; which binary handles what. |
+| `debug-loop` | The `AGENTS.md` compiler debug workflow (build → bug → nimcache diff → rep → `--overwrite`). |
+| `token-thrift` | Prefer recipe tools and terse mode; never dump a `.nif`; offload fix loops to `nim-fixer`. |
+| `repo-map` | Maintain a lazy, incremental `project-map` in file‑memory (one line per touched file); prefer `symbols`/`api` over grep/reads; persist non‑obvious toolchain facts. |
 
-### Recipe tools: orchestrate server-side, return only the answer
+| Subagent | Model | Purpose |
+|----------|-------|---------|
+| `nif-inspector` | default | Heavy NIF and phase‑artifact reading in an isolated context; returns only the conclusion. |
+| `nim-fixer` | `haiku` | Runs the compile → shrink → explain → edit → recompile loop in its own context and returns only the final diff and a verdict. |
 
-`explain_failure` and `phase_report` are **recipe** tools. Instead of the agent making a compile call, reading the diagnostics, calling `outline`, then `nif_query`-ing the culprit — each round-trip spending tokens on intermediate output — the server runs that whole orchestration itself and returns only the final answer. This is the same idea as running code-execution over MCP: keep the multi-step glue on the server and hand the model just the conclusion, not the byproducts of each step.
+## Examples
 
-- `explain_failure` collapses compile → list diagnostics → outline → query into one call, returning a ≤5-line verdict and the smallest spanning `culprit`.
-- `phase_report` compiles and summarizes every phase artifact in one call, one line each, without ever surfacing raw NIF.
+The same command works across both toolchains and returns the same diagnostic
+shape.
 
-### Hooks: transform, don't just block
-
-- **`guard-nif-read.py` upgraded to transform-not-block.** A `Read` of a `.nif` file over 15 KB is still denied — but the hook now runs `nif_outline` on it and embeds the compact outline in `permissionDecisionReason`, so the agent gets the *useful* version in the **same turn** instead of just a "don't do that" message. If anything goes wrong it falls back to the plain deny message (it never crashes the tool).
-- **`guard-nif-bash.py` (new, PreToolUse on `Bash`).** Blocks `cat`/`head`/`tail`/`less`/`more`/`bat` targeting a `.nif` path over 15 KB — the Bash-level escape hatch around the Read guard — and steers to `nif_outline` / `nif_query` / `nif_render` / `/nif`. No-op for every other command.
-
-### Commands
-
-- `/explain-failure [file]` → MCP `explain_failure`; the one-call "why did this fail" recipe.
-- `/shrink [file]` → MCP `shrink`; shows the minimal still-failing repro.
-- `/render <file.nif> [needle]` → MCP `nif_render`; pseudo-Nim view of a NIF node.
-- `/aggressive [on|off]` → explains enabling terse mode (`NIMLANG_AGGRESSIVE=1` or per-call `terse:true`) and the trade-offs.
-
-### Subagent: `nim-fixer`
-
-`agents/nim-fixer.md` auto-delegates on "fix/iterate on a failing Nim/Nimony compile." It runs the whole compile → shrink → explain → edit → recompile loop **in its own context on a cheap model (`haiku`)** and returns **only the final diff plus a verdict** — keeping all the verbose intermediate compiler output out of the main thread.
-
-### Skill: `token-thrift`
-
-`skills/token-thrift/SKILL.md` shapes the agent's behavior toward the cheap path: prefer the recipe tools (`explain_failure` / `phase_report`) over hand-rolled multi-call sequences, enable terse mode, never `cat` a `.nif`, and offload verbose fix loops to the `nim-fixer` subagent.
-
-### Beyond the MCP server
-
-The token savings don't all live in the MCP tools — v0.2 leans on the other levers a Claude Code plugin exposes:
-
-- **Transform-not-block hooks** — a denied big-`.nif` `Read` comes back with the compact outline already attached, so blocking a wasteful action also *supplies the cheap alternative* in the same turn.
-- **Bash-level guards** — `guard-nif-bash.py` closes the `cat`/`head` loophole so raw NIF can't sneak into context through the shell.
-- **Cheap-model subagents** — `nim-fixer` burns the verbose fix-loop tokens in an isolated `haiku` context and returns only a diff, so the expensive main thread never sees them.
-- **Behavior-shaping skills** — `token-thrift` nudges the agent to reach for the recipe tools and terse mode by default instead of the naive multi-call path.
-
-### Third-party APIs & project navigation
-
-Two more tools attack the *other* big token sink — re-reading dependency source and grepping the 123k-line tree to place a symbol:
-
-- **`api`** returns a dependency's **typed public interface** in one call, so the agent never `Read`s a library's source to learn its signatures. For Nim it runs `nim jsondoc` on a `.nim` path, a nimble package (`chroma`), or a stdlib module (`std/tables`) and hands back `{name, kind, sig}` triples; for a Nimony/`.nif` target the typed API *is* the compiled artifact, so it renders the NIF equivalent via `nif_render` (or tells you to compile first). Filter with `needle`, and terse mode collapses it to bare signature strings. Exposed as `/api <module> [needle]`.
-- **`symbols`** replaces raw `grep` for project-wide navigation: a name-substring search that returns structured `{defs, uses}` (file + line, optionally usages) in a single call. It is regex-based and toolchain-agnostic, so the same query works across Nim and Nimony source. Exposed as `/symbols <name>`.
-- **`repo-map` skill + lazy-incremental memory.** `skills/repo-map/SKILL.md` teaches the agent to maintain a `project-map` file-memory — one line per touched file (`path: key symbols; what it does`), grown lazily as files are outlined or edited, never via a big upfront scan — plus to reach for `symbols`/`api` before grep/Read and to persist non-obvious toolchain facts (e.g. `nimony c` exiting 0 on failure) as memories so they are never re-derived. It complements `token-thrift`: `repo-map` avoids re-discovering structure, `token-thrift` keeps each call cheap.
-
----
-
-## Works for both Nim and Nimony
-
-The point of the plugin is that the *same* commands work across both toolchains, and both return the same compact diagnostic shape instead of raw compiler output.
-
-### Nim — `/check` on a bad Nim file
+### Nim
 
 `greeter.nim`:
 
@@ -170,7 +212,7 @@ proc greet(name: string) =
   echo "hi ", nam   # typo: `nam`
 ```
 
-`/check greeter.nim` detects Nim, runs `nim check --hints:off --colors:off`, and returns:
+`/check greeter.nim` detects Nim, runs `nim check`, and returns:
 
 ```json
 {
@@ -184,9 +226,9 @@ proc greet(name: string) =
 }
 ```
 
-### Nimony — `/check` on a bad Nimony file
+### Nimony
 
-`hello.nim` (a Nimony project — a `nimony.cfg`/`nimony.paths` upstream selects the Nimony toolchain automatically):
+`hello.nim`, in a project whose `nimony.cfg`/`nimony.paths` selects Nimony:
 
 ```nim
 import std/syncio
@@ -194,13 +236,15 @@ import std/syncio
 echo "hello, world
 ```
 
-`/check hello.nim` detects Nimony, runs `nimony c`, strips the `nifmake:` / `FAILURE:` / `niflink` chatter, and — critically — reports failure even though `nimony c` exited 0, because an `Error:` line was parsed:
+`/check hello.nim` detects Nimony, runs `nimony c`, strips the build chatter,
+and reports failure despite `nimony c` exiting 0, because an `Error:` line was
+parsed:
 
 ```json
 {
   "ok": false,
   "toolchain": "nimony",
-  "stage": "check",
+  "stage": "c",
   "diagnostics": [
     { "file": "hello.nim", "line": 3, "col": 6,
       "severity": "Error", "message": "closing \" expected" }
@@ -208,37 +252,40 @@ echo "hello, world
 }
 ```
 
-In both cases the agent receives a handful of structured fields instead of a screen of compiler output, and can trust the `ok` field.
-
----
-
-## Install
-
-`nim-code` is a local plugin — you point Claude Code at this directory.
-
-**Quickest (per-session, for trying it out):**
-
-```bash
-claude --plugin-dir /home/savant/nimony-code
-```
-
-**Persistent (via a local marketplace):**
-
-```text
-/plugin marketplace add /home/savant/nimony-code
-/plugin install nim-code
-```
-
-Then enable it from the plugin manager (`/plugin`) if it isn't already. After edits to the plugin, run `/reload-plugins` to pick up changes without restarting.
-
-Plugin skills are namespaced, so the slash commands appear as `/nim-code:check`, `/nim-code:nif`, etc.; `/help` lists them under the plugin. The `nimlang` MCP server and all hooks activate automatically once the plugin is enabled.
-
----
-
 ## Requirements
 
-- **python3** (3.7+, standard library only — the MCP server and hooks have no third-party dependencies).
-- **Nim** — the `nim` and `nimsuggest` binaries, e.g. from `~/Nim/bin`. Needed for the Nim side of `compile`, `outline`, and `defs_uses`.
-- **Nimony toolchain** — `nimony`, `nimsem`, and `hastur`, e.g. from `~/nimony/bin` (built with `nim c -r src/hastur build all`). Needed for the Nimony side of every tool and for all `nif_*` tools.
+- **python3** 3.7+, standard library only. The MCP server and hooks have no
+  third‑party dependencies.
+- **Nim** — `nim` and `nimsuggest` (e.g. `~/Nim/bin`). Required for the Nim side
+  of `compile`, `outline`, `defs_uses`, and for `api` (`nim jsondoc`).
+- **Nimony** — `nimony`, `nimsem`, `hastur` (e.g. `~/nimony/bin`, built with
+  `nim c -r src/hastur build all`). Required for the Nimony side of every tool
+  and for all `nif_*` tools.
 
-The server resolves binaries from `PATH` first, falling back to `~/Nim/bin` and `~/nimony/bin`. Override the locations with the `NIM_BIN_DIR` and `NIMONY_BIN_DIR` environment variables.
+`mcp/test_server.py` starts the server and exercises all twelve tools against
+live `nim` and `nimony` compiles; run it to verify the environment.
+
+## Design notes
+
+- **Zero dependencies.** The server and hooks are stdlib‑only Python 3.7, so the
+  plugin runs wherever `python3` and the toolchains are present, with no install
+  step.
+- **Server‑side orchestration.** `explain_failure` and `phase_report` run a
+  multi‑step workflow inside one call and return only the conclusion, keeping the
+  intermediate output out of the transcript.
+- **Fail open.** Hooks and best‑effort tool paths degrade to a plain message or a
+  structured `{error, hint}` rather than blocking the agent or crashing a tool.
+- **Both toolchains, one interface.** Detection, binary resolution, a shared
+  diagnostic grammar, and a common result shape mean the same commands serve Nim
+  and Nimony without the agent tracking which is in use.
+
+## Changelog
+
+- **0.2** — Terse mode on all tools (`NIMLANG_AGGRESSIVE`); `explain_failure`,
+  `phase_report`, `nif_render`, `shrink`, `api`, `symbols`; `guard-nif-bash`
+  hook and the transform‑not‑block upgrade to `guard-nif-read`; `nim-fixer`
+  subagent; `token-thrift` and `repo-map` skills.
+- **0.1** — `nimlang` MCP server (`compile`, `outline`, `nif_outline`,
+  `nif_query`, `nif_diff`, `defs_uses`); `guard-nif-read` and
+  `trim-build-output` hooks; `nif-inspector` subagent; `nif-format`,
+  `nim-vs-nimony`, `debug-loop` skills.
