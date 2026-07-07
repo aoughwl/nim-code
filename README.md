@@ -52,12 +52,16 @@ Per session:
 claude --plugin-dir /home/savant/nimony-code
 ```
 
-Persistent, via a local marketplace:
+From the GitHub marketplace (the repo is its own marketplace):
 
 ```text
-/plugin marketplace add /home/savant/nimony-code
-/plugin install nim-code
+/plugin marketplace add aoughwl/nim-code
+/plugin install nim-code@nim-code
 ```
+
+`nim-code@nim-code` is `<plugin>@<marketplace>`; both are named `nim-code`. A
+local checkout works as a marketplace too — `/plugin marketplace add
+/home/savant/nimony-code`.
 
 Enabling the plugin auto‑registers the `nimlang` MCP server and activates all
 hooks. Run `/reload-plugins` after editing plugin files to reload without

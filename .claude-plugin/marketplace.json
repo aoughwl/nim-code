@@ -1,0 +1,14 @@
+{
+  "name": "nim-code",
+  "owner": {
+    "name": "savannt"
+  },
+  "description": "Token-efficient agent tooling for Nim and Nimony codebases.",
+  "plugins": [
+    {
+      "name": "nim-code",
+      "source": "./",
+      "description": "Structured compile/diagnostics, NIF artifact inspection, typed dependency APIs, and project navigation for Nim and Nimony — so an agent works from compact output instead of raw compiler noise and megabyte NIF files."
+    }
+  ]
+}
