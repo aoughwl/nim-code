@@ -1459,6 +1459,210 @@ def tool_shrink(args):
 
 
 # --------------------------------------------------------------------------
+# Tool: api  (typed API of a module or third-party package)
+# --------------------------------------------------------------------------
+
+# Strip trailing pragma blocks / bodies so a signature stays one compact line.
+_PRAGMA_RE = re.compile(r'\s*\{\.[^}]*\.\}')
+
+
+def _clean_sig(code):
+    """Collapse a jsondoc `code` blob into one compact signature line."""
+    if not code:
+        return ''
+    # Keep only up to the '=' that starts a body (if any), first line only.
+    line = code.replace('\n', ' ')
+    line = _PRAGMA_RE.sub('', line)
+    eq = line.find(' = ')
+    if eq != -1:
+        line = line[:eq]
+    return ' '.join(line.split())
+
+
+def _nimble_pkg_dir(pkg):
+    """Resolve an installed nimble package to its source dir, or None."""
+    rc, out, timed = run([nim_bin('nimble'), 'path', pkg], timeout=30)
+    if rc != 0 or timed:
+        return None
+    for ln in reversed(out.splitlines()):
+        ln = ln.strip()
+        if ln and os.path.isdir(ln):
+            return ln
+    return None
+
+
+def _resolve_module(module, toolchain):
+    """Map `module` (a path or a bare package/module name) to a source file.
+    Returns (path, error). Prefers an existing file; else a nimble package's
+    `<pkg>.nim`; else a stdlib `std/<name>` module under the Nim lib."""
+    if os.path.isfile(module):
+        return module, None
+    # bare package name -> <dir>/<pkg>.nim
+    base = module.split('/')[-1]
+    pkgdir = _nimble_pkg_dir(base)
+    if pkgdir:
+        cand = os.path.join(pkgdir, base + '.nim')
+        if os.path.isfile(cand):
+            return cand, None
+    # stdlib std/<name>
+    libname = module[4:] if module.startswith('std/') else module
+    for sub in ('pure', 'std', '', 'core'):
+        cand = _home('Nim', 'lib', sub, libname + '.nim')
+        if os.path.isfile(cand):
+            return cand, None
+    return None, 'could not resolve module %r (not a file, nimble pkg, or ' \
+                 'stdlib module)' % module
+
+
+def tool_api(args):
+    module = args.get('module')
+    if not module:
+        return {'error': 'missing required arg: module'}
+    toolchain = args.get('toolchain', 'auto')
+    needle = args.get('needle')
+    terse = resolve_terse(args)
+
+    # Nimony (or a raw .nif): the typed API IS the compiled artifact.
+    if module.endswith('.nif') or toolchain == 'nimony':
+        if module.endswith('.nif') and os.path.isfile(module):
+            r = tool_nif_render({'nif_file': module, 'needle': needle,
+                                 'terse': terse})
+            r['toolchain'] = 'nimony'
+            r['module'] = module
+            return r
+        return {'toolchain': 'nimony', 'module': module,
+                'note': 'Nimony typed API = the compiled .s.nif. Compile the '
+                        'module, then call nif_render/nif_outline on its '
+                        'nimcache artifact.'}
+
+    # Nim: jsondoc gives a typed API for any module, incl. nimble packages.
+    src, err = _resolve_module(module, toolchain)
+    if err:
+        return {'error': err}
+    out_json = os.path.join(
+        os.path.dirname(os.path.abspath(src)) or '.',
+        '.api_%d.json' % os.getpid())
+    cmd = [nim_bin('nim'), 'jsondoc', '--hints:off', '--colors:off',
+           '-o:' + out_json, src]
+    rc, out, timed = run(cmd, cwd=os.path.dirname(src) or None, timeout=120)
+    entries = []
+    try:
+        if os.path.isfile(out_json):
+            with open(out_json, 'r', errors='replace') as fh:
+                doc = json.load(fh)
+            entries = doc.get('entries', []) if isinstance(doc, dict) else []
+    except (ValueError, IOError, OSError):
+        entries = []
+    finally:
+        try:
+            os.remove(out_json)
+        except OSError:
+            pass
+
+    if not entries:
+        return {'error': 'jsondoc produced no entries for %s' % src,
+                'toolchain': 'nim', 'module': module}
+
+    needle_l = needle.lower() if needle else None
+    items = []
+    for e in entries:
+        name = e.get('name') or ''
+        if needle_l and needle_l not in name.lower():
+            continue
+        kind = e.get('type') or ''
+        if kind.startswith('sk'):
+            kind = kind[2:].lower()
+        sig = _clean_sig(e.get('code') or '')
+        if terse:
+            items.append(sig or ('%s %s' % (kind, name)))
+        else:
+            items.append({'name': name, 'kind': kind, 'sig': sig})
+
+    return {'toolchain': 'nim', 'module': module, 'source': src,
+            'api': items}
+
+
+# --------------------------------------------------------------------------
+# Tool: symbols  (project-wide symbol search by NAME)
+# --------------------------------------------------------------------------
+
+# Directories that never hold hand-written project sources worth indexing.
+_SKIP_DIRS = set(['nimcache', '.git', 'htmldocs', 'nimblecache',
+                  '__pycache__'])
+_MAX_FILES = 4000
+_MAX_HITS = 400
+
+
+def _iter_nim_files(root):
+    count = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in _SKIP_DIRS and not d.startswith('.nimble')]
+        for fn in filenames:
+            if fn.endswith('.nim') or fn.endswith('.nims'):
+                count += 1
+                if count > _MAX_FILES:
+                    return
+                yield os.path.join(dirpath, fn)
+
+
+def tool_symbols(args):
+    name = args.get('name')
+    if not name:
+        return {'error': 'missing required arg: name'}
+    root = args.get('root') or '.'
+    if not os.path.isdir(root):
+        root = os.path.dirname(os.path.abspath(root)) or '.'
+    kind_filter = args.get('kind')
+    want_uses = bool(args.get('uses'))
+    terse = resolve_terse(args)
+
+    name_l = name.lower()
+    use_re = re.compile(r'(?<![\w`])' + re.escape(name) + r'(?![\w`])')
+
+    defs = []
+    uses = []
+    truncated = False
+    for path in _iter_nim_files(root):
+        if len(defs) >= _MAX_HITS:
+            truncated = True
+            break
+        try:
+            with open(path, 'r', errors='replace') as fh:
+                lines = fh.readlines()
+        except (IOError, OSError):
+            continue
+        rel = os.path.relpath(path, root)
+        for idx, raw in enumerate(lines, start=1):
+            m = OUTLINE_RE.match(raw)
+            if m is not None:
+                dname = m.group('name').strip('`')
+                if name_l in dname.lower():
+                    if kind_filter and m.group('kind') != kind_filter:
+                        pass
+                    else:
+                        defs.append({'name': dname, 'kind': m.group('kind'),
+                                     'file': rel, 'line': idx})
+            if want_uses and len(uses) < _MAX_HITS and use_re.search(raw):
+                uses.append({'file': rel, 'line': idx})
+
+    if terse:
+        d = ['%s:%s %s %s' % (x['file'], x['line'], x['kind'], x['name'])
+             for x in defs]
+        result = {'defs': d}
+        if want_uses:
+            result['uses'] = ['%s:%s' % (u['file'], u['line']) for u in uses]
+    else:
+        result = {'defs': defs}
+        if want_uses:
+            result['uses'] = uses
+    result['root'] = root
+    if truncated:
+        result['truncated'] = True
+    return result
+
+
+# --------------------------------------------------------------------------
 # Tool registry / schemas
 # --------------------------------------------------------------------------
 
@@ -1630,6 +1834,52 @@ TOOLS = [
             'required': ['file'],
         },
         'handler': tool_shrink,
+    },
+    {
+        'name': 'api',
+        'description': 'Typed public API of a module or third-party package. '
+                       'Nim: nim jsondoc (resolves nimble packages & stdlib) -> '
+                       'compact signatures. Nimony/.nif: render the compiled '
+                       'artifact. Avoids reading dependency source.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'module': {'type': 'string',
+                           'description': 'A .nim path, a nimble package name '
+                                          '(e.g. "chroma"), a std module '
+                                          '("std/tables"), or a .nif file.'},
+                'toolchain': TOOLCHAIN_ENUM,
+                'needle': {'type': 'string',
+                           'description': 'Only return symbols whose name '
+                                          'contains this substring.'},
+                'terse': TERSE_PROP,
+            },
+            'required': ['module'],
+        },
+        'handler': tool_api,
+    },
+    {
+        'name': 'symbols',
+        'description': 'Find a symbol across the whole project by NAME '
+                       '(substring). Returns definitions (file:line:kind) and '
+                       'optionally usages. Replaces raw grep for navigation.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'name': {'type': 'string',
+                         'description': 'Symbol name or substring to find.'},
+                'root': {'type': 'string',
+                         'description': 'Directory to search (default cwd).'},
+                'kind': {'type': 'string',
+                         'description': 'Optional filter: proc/type/const/...'},
+                'uses': {'type': 'boolean',
+                         'description': 'Also return usage sites (default '
+                                        'false).'},
+                'terse': TERSE_PROP,
+            },
+            'required': ['name'],
+        },
+        'handler': tool_symbols,
     },
 ]
 

@@ -64,9 +64,9 @@ nim-code/                      ${CLAUDE_PLUGIN_ROOT}
 - `guard-nif-bash.py` (PreToolUse on `Bash`, **v0.2**) blocks `cat`/`head`/`tail` etc. of a big `.nif`, closing the shell-level loophole around the Read guard.
 - `trim-build-output.py` (PostToolUse on `Bash`) strips `nifmake:` / `FAILURE:` / `niflink` lines from `nimony`/`hastur`/`nim c`/`nimble` output and surfaces just the diagnostics.
 
-**8 slash commands**: `/check`, `/nif`, `/phase-diff`, `/nimony-bug`, and the v0.2 additions `/explain-failure`, `/shrink`, `/render`, `/aggressive` (see below).
+**10 slash commands**: `/check`, `/nif`, `/phase-diff`, `/nimony-bug`, the v0.2 additions `/explain-failure`, `/shrink`, `/render`, `/aggressive`, and the navigation commands `/api`, `/symbols` (see below).
 
-**4 skills**: `nif-format`, `nim-vs-nimony`, `debug-loop`, and the v0.2 `token-thrift` — loaded on demand so the agent doesn't re-read `doc/tags.md`, re-derive toolchain differences, or forget the cheap path each session.
+**5 skills**: `nif-format`, `nim-vs-nimony`, `debug-loop`, the v0.2 `token-thrift`, and `repo-map` — loaded on demand so the agent doesn't re-read `doc/tags.md`, re-derive toolchain differences, re-outline files, or forget the cheap path each session.
 
 **2 subagents**: `nif-inspector` — does heavy NIF / phase-artifact reading in its own context and returns only the conclusion, keeping large S-expr out of the main thread (handles both Nim source and Nimony NIF); and the v0.2 `nim-fixer` — runs the fix loop on a cheap model in its own context and returns only the final diff.
 
@@ -74,7 +74,7 @@ nim-code/                      ${CLAUDE_PLUGIN_ROOT}
 
 ## MCP tools
 
-All ten are exposed by the `nimlang` server. `compile`, `outline`, `defs_uses`, `explain_failure`, `phase_report`, and `shrink` work for **both** toolchains; the `nif_*` tools (including `nif_render`) operate on Nimony's NIF artifacts and are **Nimony-only**. The last four tools are new in v0.2 — see [Aggressive mode](#aggressive-mode-v02).
+All twelve are exposed by the `nimlang` server. `compile`, `outline`, `defs_uses`, `explain_failure`, `phase_report`, `shrink`, `api`, and `symbols` work for **both** toolchains; the `nif_*` tools (including `nif_render`) operate on Nimony's NIF artifacts and are **Nimony-only** (`api` on a Nimony/`.nif` target renders the NIF equivalent). The last four tools are new in v0.2 — see [Aggressive mode](#aggressive-mode-v02).
 
 | Tool | What it does | Toolchain(s) |
 |------|--------------|--------------|
@@ -88,6 +88,9 @@ All ten are exposed by the `nimlang` server. `compile`, `outline`, `defs_uses`, 
 | `phase_report(file, toolchain="auto", terse=…)` **(v0.2)** | **Recipe tool.** Compiles, then for each `nimcache/*.<phase>.nif` (p, s, …) gives a 1-line summary (top tag counts + size) with **no raw NIF**. Nim returns `{ok, phases:[], note:"Nim C backend has no NIF phases"}`. | Nim **and** Nimony |
 | `nif_render(nif_file, needle=None, terse=…)` **(v0.2)** | Renders matching NIF node(s) as compact **pseudo-Nim** (maps `proc`/`var`/`let`/`const`/`call`/`if`/`asgn`/`ret`/`type`/… to Nim-ish syntax, demangles `sym.NN.mod` → `sym`), falling back to a raw snippet for unknown tags. ~10× smaller than raw NIF. | Nimony only |
 | `shrink(file, toolchain="auto")` **(v0.2)** | Delta-debugs a failing file: iteratively drops top-level statements/lines while the **first** `Error:` message is preserved, returning `{original_lines, minimal_lines, minimal_source, kept_error}` — the minimal still-failing repro. Iteration/time bounded. | Nim **and** Nimony |
+| `api(module, toolchain="auto", needle=None, terse=…)` | Returns the **typed public API** of a module or third-party package **without reading its source**. Nim runs `nim jsondoc` on a `.nim` path, a nimble package name (e.g. `chroma`), or a stdlib module (e.g. `std/tables`) and returns `{toolchain, module, source, api:[{name, kind, sig}]}`. `needle` filters by name substring; terse collapses `api` to compact signature strings. | Nim (via `nim jsondoc`) |
+| `api(module, …)` on a `.nif` / Nimony target | The typed API **is** the compiled artifact: renders the `.nif` via `nif_render`, or returns a note to compile first and then use `nif_render`/`nif_outline`. | Nimony (`.nif`) |
+| `symbols(name, root=".", kind=None, uses=false, terse=…)` | Project-wide symbol search by **name substring**, regex-based and toolchain-agnostic — replaces raw `grep` for "where is X defined/used". Returns `{defs:[{name,kind,file,line}], root}`, plus `{uses:[{file,line}]}` when `uses:true`. Terse collapses to `defs:["file:line kind name"]`, `uses:["file:line"]`. | Nim **and** Nimony |
 
 ---
 
@@ -143,6 +146,14 @@ The token savings don't all live in the MCP tools — v0.2 leans on the other le
 - **Bash-level guards** — `guard-nif-bash.py` closes the `cat`/`head` loophole so raw NIF can't sneak into context through the shell.
 - **Cheap-model subagents** — `nim-fixer` burns the verbose fix-loop tokens in an isolated `haiku` context and returns only a diff, so the expensive main thread never sees them.
 - **Behavior-shaping skills** — `token-thrift` nudges the agent to reach for the recipe tools and terse mode by default instead of the naive multi-call path.
+
+### Third-party APIs & project navigation
+
+Two more tools attack the *other* big token sink — re-reading dependency source and grepping the 123k-line tree to place a symbol:
+
+- **`api`** returns a dependency's **typed public interface** in one call, so the agent never `Read`s a library's source to learn its signatures. For Nim it runs `nim jsondoc` on a `.nim` path, a nimble package (`chroma`), or a stdlib module (`std/tables`) and hands back `{name, kind, sig}` triples; for a Nimony/`.nif` target the typed API *is* the compiled artifact, so it renders the NIF equivalent via `nif_render` (or tells you to compile first). Filter with `needle`, and terse mode collapses it to bare signature strings. Exposed as `/api <module> [needle]`.
+- **`symbols`** replaces raw `grep` for project-wide navigation: a name-substring search that returns structured `{defs, uses}` (file + line, optionally usages) in a single call. It is regex-based and toolchain-agnostic, so the same query works across Nim and Nimony source. Exposed as `/symbols <name>`.
+- **`repo-map` skill + lazy-incremental memory.** `skills/repo-map/SKILL.md` teaches the agent to maintain a `project-map` file-memory — one line per touched file (`path: key symbols; what it does`), grown lazily as files are outlined or edited, never via a big upfront scan — plus to reach for `symbols`/`api` before grep/Read and to persist non-obvious toolchain facts (e.g. `nimony c` exiting 0 on failure) as memories so they are never re-derived. It complements `token-thrift`: `repo-map` avoids re-discovering structure, `token-thrift` keeps each call cheap.
 
 ---
 

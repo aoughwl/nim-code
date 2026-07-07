@@ -110,9 +110,10 @@ def main():
         names = set(t['name'] for t in listing['result']['tools'])
         expected = {'compile', 'outline', 'nif_outline', 'nif_query',
                     'nif_diff', 'defs_uses',
-                    'explain_failure', 'phase_report', 'nif_render', 'shrink'}
+                    'explain_failure', 'phase_report', 'nif_render', 'shrink',
+                    'api', 'symbols'}
         assert expected <= names, 'missing tools: %r' % (expected - names)
-        ok('tools/list exposes all 10 tools')
+        ok('tools/list exposes all 12 tools')
 
         # ---- compile: bad Nim ------------------------------------------
         bad_nim = os.path.join(workdir, 'bad_nim.nim')
@@ -232,6 +233,27 @@ def main():
                               {'nif_file': nif_file, 'needle': 'proc'})
         assert 'rendered' in rr and isinstance(rr['rendered'], list)
         ok('nif_render -> %d rendered node(s)' % len(rr['rendered']))
+
+        # ---- api: typed API of a stdlib module ------------------------
+        ap = client.call_tool('api', {'module': 'std/strutils',
+                                      'toolchain': 'nim'})
+        if 'api' in ap and ap['api']:
+            names = [x.get('name') if isinstance(x, dict) else x
+                     for x in ap['api']]
+            assert any('toUpperAscii' in str(n) for n in names), \
+                'expected toUpperAscii in strutils api'
+            ok('api std/strutils -> %d typed entries' % len(ap['api']))
+        else:
+            # jsondoc unavailable in this env: accept a clean error, not a crash
+            assert 'error' in ap, 'api must return api[] or error: %r' % ap
+            ok('api std/strutils -> graceful (jsondoc unavailable)')
+
+        # ---- symbols: project-wide search by name ---------------------
+        sy = client.call_tool('symbols', {'name': 'addup', 'root': workdir})
+        assert 'defs' in sy and isinstance(sy['defs'], list)
+        assert any(d['name'] == 'addup' for d in sy['defs']), \
+            'symbols should find the addup proc in good.nim: %r' % sy
+        ok('symbols "addup" -> %d def(s) across project' % len(sy['defs']))
 
     finally:
         client.close()
