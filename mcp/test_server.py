@@ -109,9 +109,10 @@ def main():
         listing = client.request('tools/list')
         names = set(t['name'] for t in listing['result']['tools'])
         expected = {'compile', 'outline', 'nif_outline', 'nif_query',
-                    'nif_diff', 'defs_uses'}
+                    'nif_diff', 'defs_uses',
+                    'explain_failure', 'phase_report', 'nif_render', 'shrink'}
         assert expected <= names, 'missing tools: %r' % (expected - names)
-        ok('tools/list exposes all 6 tools')
+        ok('tools/list exposes all 10 tools')
 
         # ---- compile: bad Nim ------------------------------------------
         bad_nim = os.path.join(workdir, 'bad_nim.nim')
@@ -192,6 +193,45 @@ def main():
                                      {'file_a': nif_file, 'file_b': other})
                 assert 'changed' in d and isinstance(d['changed'], list)
                 ok('nif_diff -> %d changed lines' % len(d['changed']))
+
+        # ---- v0.2: terse compile -> compact string diagnostics --------
+        tres = client.call_tool('compile',
+                                {'file': bad_nim, 'toolchain': 'nim',
+                                 'terse': True})
+        assert tres['ok'] is False
+        assert isinstance(tres['diagnostics'], list)
+        assert tres['diagnostics'], 'terse compile should still list errors'
+        assert all(isinstance(d, str) for d in tres['diagnostics']), \
+            'terse diagnostics must be compact strings: %r' % tres['diagnostics']
+        ok('compile terse -> compact "file:line:col msg" strings')
+
+        # ---- v0.2: explain_failure (Nim) ------------------------------
+        ef = client.call_tool('explain_failure',
+                              {'file': bad_nim, 'toolchain': 'nim'})
+        assert ef['ok'] is False
+        assert ef.get('verdict'), 'explain_failure needs a verdict: %r' % ef
+        ok('explain_failure Nim -> verdict + culprit')
+
+        # ---- v0.2: explain_failure (Nimony) ---------------------------
+        efn = client.call_tool('explain_failure',
+                               {'file': bad_nimony, 'toolchain': 'nimony'})
+        assert efn['ok'] is False
+        assert efn.get('verdict'), 'explain_failure(nimony) needs verdict: %r' % efn
+        ok('explain_failure Nimony -> verdict + culprit')
+
+        # ---- v0.2: shrink preserves the failure -----------------------
+        sh = client.call_tool('shrink', {'file': bad_nim, 'toolchain': 'nim'})
+        assert 'minimal_source' in sh and 'original_lines' in sh, \
+            'shrink shape: %r' % sh
+        assert sh['minimal_lines'] <= sh['original_lines']
+        ok('shrink -> %s -> %s lines'
+           % (sh['original_lines'], sh['minimal_lines']))
+
+        # ---- v0.2: nif_render -> compact pseudo-Nim -------------------
+        rr = client.call_tool('nif_render',
+                              {'nif_file': nif_file, 'needle': 'proc'})
+        assert 'rendered' in rr and isinstance(rr['rendered'], list)
+        ok('nif_render -> %d rendered node(s)' % len(rr['rendered']))
 
     finally:
         client.close()

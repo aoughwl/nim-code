@@ -62,6 +62,41 @@ def parse_diagnostics(text):
 
 
 # --------------------------------------------------------------------------
+# Terse mode (v0.2 aggressive token-saving layer)
+# --------------------------------------------------------------------------
+
+def _env_truthy(val):
+    if val is None:
+        return False
+    return str(val).strip().lower() not in ('', '0', 'false', 'no', 'off')
+
+
+def terse_default():
+    """Default terse setting from env NIMLANG_AGGRESSIVE (truthy)."""
+    return _env_truthy(os.environ.get('NIMLANG_AGGRESSIVE'))
+
+
+def resolve_terse(args):
+    """Per-call terse: explicit `terse` arg wins, else env default."""
+    if isinstance(args, dict) and 'terse' in args and args['terse'] is not None:
+        return bool(args['terse'])
+    return terse_default()
+
+
+def diag_to_str(d):
+    """Terse one-line form of a diagnostic dict: 'file:line:col msg'."""
+    return '%s:%s:%s %s' % (d.get('file', '?'), d.get('line', '?'),
+                            d.get('col', '?'), d.get('message', ''))
+
+
+def pos_to_str(obj):
+    """Terse 'file:line' for a {file,line,col} dict (or None -> None)."""
+    if not obj:
+        return None
+    return '%s:%s' % (obj.get('file', '?'), obj.get('line', '?'))
+
+
+# --------------------------------------------------------------------------
 # Binary resolution
 # --------------------------------------------------------------------------
 
@@ -210,6 +245,22 @@ def tool_compile(args):
     else:
         ok = (rc == 0) and not has_error
 
+    if timed_out:
+        ok = False
+
+    if resolve_terse(args):
+        # drop Warning/Hint, diagnostics become "file:line:col msg" strings.
+        kept = [d for d in diags if d['severity'] in ('Error', 'Trace')]
+        result = {
+            'ok': ok,
+            'toolchain': toolchain,
+            'stage': stage,
+            'diagnostics': [diag_to_str(d) for d in kept],
+        }
+        if timed_out:
+            result['timed_out'] = True
+        return result
+
     result = {
         'ok': ok,
         'toolchain': toolchain,
@@ -217,7 +268,6 @@ def tool_compile(args):
         'diagnostics': diags,
     }
     if timed_out:
-        result['ok'] = False
         result['timed_out'] = True
     return result
 
@@ -297,6 +347,9 @@ def tool_outline(args):
         symbols, err = outline_regex(file_path)
         if symbols is None:
             return {'error': err or 'could not read file', 'toolchain': toolchain}
+    if resolve_terse(args):
+        return {'toolchain': toolchain,
+                'symbols': ['%s:%s' % (s['name'], s['line']) for s in symbols]}
     result = {'toolchain': toolchain, 'symbols': symbols}
     if used_fallback:
         result['source'] = 'regex-fallback'
@@ -385,6 +438,106 @@ def _read_nif(nif_file):
         return fh.read()
 
 
+# --------------------------------------------------------------------------
+# NIF line-info decoding (base62 deltas, relative to parent node).
+# Mirrors nifreader.handleLineInfo + nifstreams.rawNext: each node's absolute
+# (line, col) = parent absolute + this node's delta; a filename resets to an
+# absolute position. Columns are 0-based in NIF; source diagnostics are 1-based.
+# --------------------------------------------------------------------------
+
+def _b62(c):
+    if '0' <= c <= '9':
+        return ord(c) - 48
+    if 'A' <= c <= 'Z':
+        return ord(c) - 65 + 10
+    if 'a' <= c <= 'z':
+        return ord(c) - 97 + 36
+    return None
+
+
+def _clean_symbol(tok):
+    """Strip line-info suffix and leading ':' from a NIF atom/tag token."""
+    if tok is None:
+        return ''
+    m = re.search(r'[@~]', tok)
+    if m is not None:
+        tok = tok[:m.start()]
+    return tok.lstrip(':')
+
+
+def _parse_suffix(tok):
+    """Decode a token's NIF line-info suffix.
+
+    Returns (col_delta, line_delta, filename_or_None) or None if the token
+    carries no suffix.
+    """
+    if tok is None:
+        return None
+    m = re.search(r'[@~]', tok)
+    if m is None:
+        return None
+    s = tok[m.start():]
+    if s[:1] == '@':
+        s = s[1:]
+    i = 0
+    n = len(s)
+    col = 0
+    neg = False
+    if i < n and s[i] == '~':
+        neg = True
+        i += 1
+    while i < n and _b62(s[i]) is not None:
+        col = col * 62 + _b62(s[i])
+        i += 1
+    if neg:
+        col = -col
+    line = 0
+    if i < n and s[i] == ',':
+        i += 1
+        neg2 = False
+        if i < n and s[i] == '~':
+            neg2 = True
+            i += 1
+        while i < n and _b62(s[i]) is not None:
+            line = line * 62 + _b62(s[i])
+            i += 1
+        if neg2:
+            line = -line
+    fname = None
+    if i < n and s[i] == ',':
+        fname = s[i + 1:]
+    return (col, line, fname)
+
+
+def nif_forms_with_pos(text):
+    """Return the flat form list with an absolute source position on each.
+
+    Each form gains f['src'] = (file, line, col) with a 1-based col (converted
+    from NIF's 0-based). Uses the paren scanner then a pre-order pass that
+    accumulates base62 deltas against the enclosing parent form.
+    """
+    forms = nif_parse_forms(text)
+    stack = []  # (depth, file, line, col)
+    for f in forms:
+        d = f['depth']
+        while stack and stack[-1][0] >= d:
+            stack.pop()
+        parent = stack[-1] if stack else (-1, None, 0, 0)
+        tag_tok = f['tokens'][0] if f['tokens'] else ''
+        suf = _parse_suffix(tag_tok)
+        if suf is None:
+            cd, ld, fn = 0, 0, None
+        else:
+            cd, ld, fn = suf
+        if fn:
+            afile, aline, acol = fn, ld, cd
+        else:
+            afile, aline, acol = parent[1], parent[2] + ld, parent[3] + cd
+        f['src'] = (afile, aline, acol + 1)  # to 1-based col
+        stack.append((d, afile, aline, acol))
+    return forms
+
+
 def tool_nif_outline(args):
     nif_file = args.get('nif_file')
     if not nif_file:
@@ -427,6 +580,15 @@ def tool_nif_outline(args):
             tag = _base_tag(f['tokens'][0])
             name = _clean_name(f['tokens'][1]) if len(f['tokens']) > 1 else ''
             tags.append({'tag': tag, 'name': name, 'line': f['line']})
+    if resolve_terse(args):
+        # no null/empty fields
+        terse = []
+        for node in tags:
+            item = {'tag': node['tag'], 'line': node['line']}
+            if node['name']:
+                item['name'] = node['name']
+            terse.append(item)
+        return {'tags': terse}
     return {'tags': tags}
 
 
@@ -459,6 +621,8 @@ def tool_nif_query(args):
     except (IOError, OSError) as e:
         return {'error': str(e)}
 
+    terse = resolve_terse(args)
+    max_lines = 15 if terse else 40
     needle_l = needle.lower()
     forms = nif_parse_forms(text)
     matches = []
@@ -476,8 +640,15 @@ def tool_nif_query(args):
             if key in seen:
                 continue
             seen.add(key)
-            snippet = _truncate_snippet(text[f['start']:f['end']])
-            matches.append({'tag': tag, 'name': name, 'snippet': snippet})
+            snippet = _truncate_snippet(text[f['start']:f['end']],
+                                        max_lines=max_lines)
+            if terse:
+                item = {'tag': tag, 'snippet': snippet}
+                if name:
+                    item['name'] = name
+                matches.append(item)
+            else:
+                matches.append({'tag': tag, 'name': name, 'snippet': snippet})
             if len(matches) >= cap:
                 break
     return {'matches': matches, 'count': len(matches)}
@@ -641,8 +812,650 @@ def tool_defs_uses(args):
         return {'error': 'line and col must be integers'}
     toolchain = resolve_toolchain(file_path, args.get('toolchain', 'auto'))
     if toolchain == 'nimony':
-        return defs_uses_nimony(file_path, line, col)
-    return defs_uses_nim(file_path, line, col)
+        result = defs_uses_nimony(file_path, line, col)
+    else:
+        result = defs_uses_nim(file_path, line, col)
+    if resolve_terse(args):
+        terse = {'def': pos_to_str(result.get('def')),
+                 'uses': [pos_to_str(u) for u in result.get('uses', [])]}
+        if 'error' in result:
+            terse['error'] = result['error']
+        return terse
+    return result
+
+
+# --------------------------------------------------------------------------
+# Nimcache artifact discovery (shared by explain_failure / phase_report)
+# --------------------------------------------------------------------------
+
+def _artifact_names_basename(path, basename):
+    """True if a NIF artifact's stmts header names the given source basename."""
+    try:
+        with open(path, 'r', errors='replace') as fh:
+            head = fh.read(4096)
+    except (IOError, OSError):
+        return False
+    for hl in head.splitlines()[:6]:
+        if hl.startswith('(stmts') and (',' + basename) in hl:
+            return True
+    return False
+
+
+def _find_module_nif(cwd, basename, phase):
+    """Newest nimcache/*.<phase>.nif whose stmts header names basename."""
+    ncache = os.path.join(cwd, 'nimcache')
+    pat = os.path.join(ncache, '*.' + phase + '.nif')
+    cands = sorted(glob.glob(pat), key=os.path.getmtime, reverse=True)
+    for path in cands:
+        if '.deps.' in os.path.basename(path):
+            continue
+        if _artifact_names_basename(path, basename):
+            return path
+    return None
+
+
+# --------------------------------------------------------------------------
+# NIF -> pseudo-Nim rendering (for nif_render)
+# --------------------------------------------------------------------------
+
+def _nif_tokenize(text):
+    toks = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c.isspace():
+            i += 1
+            continue
+        if c == '(' or c == ')':
+            toks.append(c)
+            i += 1
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == '\\':
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            toks.append(text[i:j + 1])
+            i = j + 1
+            continue
+        j = i
+        while j < n and (not text[j].isspace()) and text[j] not in '()':
+            j += 1
+        toks.append(text[i:j])
+        i = j
+    return toks
+
+
+def _nif_build(toks, pos):
+    """Build a nested node {tag, children} from tokens; children are nodes or
+    raw atom strings. `pos` must point at a '('. Returns (node, next_pos)."""
+    pos += 1  # skip '('
+    tag = ''
+    if pos < len(toks) and toks[pos] not in ('(', ')'):
+        tag = toks[pos]
+        pos += 1
+    children = []
+    while pos < len(toks) and toks[pos] != ')':
+        if toks[pos] == '(':
+            child, pos = _nif_build(toks, pos)
+            children.append(child)
+        else:
+            children.append(toks[pos])
+            pos += 1
+    if pos < len(toks):
+        pos += 1  # skip ')'
+    return {'tag': tag, 'children': children}, pos
+
+
+_ESCAPE_RE = re.compile(r'\\([0-9A-Fa-f]{2})')
+
+
+def _demangle(atom):
+    """Render a NIF atom as Nim-ish: strip line info, demangle sym.NN.mod->sym,
+    decode \\HH operator escapes, map dot tokens to ''."""
+    if not isinstance(atom, str):
+        return ''
+    if atom == '.':
+        return ''
+    if atom[:1] == '"':
+        return atom
+    if '\\' in atom:
+        atom = _ESCAPE_RE.sub(lambda m: chr(int(m.group(1), 16)), atom)
+    cleaned = _clean_symbol(atom)
+    m = re.match(r'([A-Za-z_][A-Za-z0-9_]*)\.\d+', cleaned)
+    if m is not None:
+        rest = cleaned[m.end():]
+        if rest == '' or rest.startswith('.'):
+            return m.group(1)
+    return cleaned
+
+
+_BINOP = {
+    'add': '+', 'sub': '-', 'mul': '*', 'div': 'div', 'mod': 'mod',
+    'shl': 'shl', 'shr': 'shr', 'bitand': 'and', 'bitor': 'or',
+    'bitxor': 'xor', 'eq': '==', 'neq': '!=', 'lt': '<', 'le': '<=',
+    'gt': '>', 'ge': '>=', 'and': 'and', 'or': 'or', 'xor': 'xor',
+}
+
+
+def _r(x):
+    return _render_node(x) if isinstance(x, dict) else _demangle(x)
+
+
+def _nonempty(children):
+    out = []
+    for c in children:
+        r = _r(c)
+        if r != '':
+            out.append(r)
+    return out
+
+
+def _child_nodes(children, tag):
+    return [c for c in children
+            if isinstance(c, dict) and _base_tag(c['tag']) == tag]
+
+
+def _render_node(node):
+    """Map a NIF node to a compact pseudo-Nim string. Unknown tags fall back
+    to a compact raw s-expr."""
+    tag = _base_tag(node.get('tag', ''))
+    ch = node.get('children', [])
+
+    if tag == 'stmts':
+        lines = []
+        for c in ch:
+            r = _r(c)
+            if r != '':
+                lines.append(r)
+        return '\n'.join(lines)
+
+    if tag in ('proc', 'func', 'method', 'macro', 'template', 'iterator',
+               'converter'):
+        name = _r(ch[0]) if ch else ''
+        params = _child_nodes(ch, 'params')
+        param_str = _render_node(params[0]) if params else ''
+        body = _child_nodes(ch, 'stmts')
+        ret = ''
+        # return type: first non-dot atom / type node after params
+        seen_params = False
+        for c in ch[1:]:
+            if isinstance(c, dict) and _base_tag(c['tag']) == 'params':
+                seen_params = True
+                continue
+            if seen_params:
+                r = _r(c)
+                if r != '' and not (isinstance(c, dict) and
+                                    _base_tag(c['tag']) == 'stmts'):
+                    ret = r
+                    break
+        head = '%s %s(%s)' % (tag, name, param_str)
+        if ret:
+            head = head + ': ' + ret
+        if body:
+            inner = _render_node(body[0])
+            inner = '\n'.join('  ' + l for l in inner.splitlines())
+            return head + ' =\n' + inner
+        return head
+
+    if tag == 'params':
+        return ', '.join(_r(c) for c in ch
+                         if isinstance(c, dict) and
+                         _base_tag(c['tag']) in ('param', 'fld'))
+
+    if tag in ('param', 'fld'):
+        name = _r(ch[0]) if ch else ''
+        typ = ''
+        for c in ch[1:]:
+            r = _r(c)
+            if r != '':
+                typ = r
+                break
+        if typ:
+            return '%s: %s' % (name, typ)
+        return name
+
+    if tag in ('let', 'var', 'const', 'glet', 'gvar', 'tvar', 'cursor'):
+        kw = 'var' if tag in ('var', 'gvar', 'tvar') else \
+            ('const' if tag == 'const' else 'let')
+        name = _r(ch[0]) if ch else ''
+        rest = _nonempty(ch[1:])
+        if len(rest) >= 2:
+            return '%s %s: %s = %s' % (kw, name, rest[0], rest[-1])
+        if len(rest) == 1:
+            return '%s %s = %s' % (kw, name, rest[0])
+        return '%s %s' % (kw, name)
+
+    if tag in ('call', 'cmd'):
+        if not ch:
+            return tag + '()'
+        callee = _r(ch[0])
+        args = [_r(c) for c in ch[1:]]
+        return '%s(%s)' % (callee, ', '.join(a for a in args if a != ''))
+
+    if tag == 'infix':
+        if len(ch) >= 3:
+            return '%s %s %s' % (_r(ch[1]), _r(ch[0]), _r(ch[2]))
+        return ' '.join(_r(c) for c in ch)
+
+    if tag in _BINOP and len(ch) >= 3:
+        return '%s %s %s' % (_r(ch[-2]), _BINOP[tag], _r(ch[-1]))
+
+    if tag == 'asgn' and len(ch) >= 2:
+        return '%s = %s' % (_r(ch[0]), _r(ch[1]))
+
+    if tag == 'ret':
+        inner = _nonempty(ch)
+        return 'return ' + (inner[0] if inner else '')
+
+    if tag == 'result':
+        return ''  # implicit result declaration
+
+    if tag in ('if', 'when'):
+        parts = []
+        for c in ch:
+            if not isinstance(c, dict):
+                continue
+            btag = _base_tag(c['tag'])
+            cc = c['children']
+            if btag in ('elif',) and len(cc) >= 2:
+                parts.append('%s %s: %s' % (tag, _r(cc[0]), _r(cc[1])))
+            elif btag == 'else' and cc:
+                parts.append('else: %s' % _r(cc[0]))
+        return '\n'.join(parts) if parts else tag
+
+    if tag == 'type':
+        name = _r(ch[0]) if ch else ''
+        body = ''
+        for c in ch[1:]:
+            r = _r(c)
+            if r != '':
+                body = r
+        return 'type %s = %s' % (name, body) if body else 'type %s' % name
+
+    if tag == 'object':
+        flds = _child_nodes(ch, 'fld')
+        if flds:
+            body = '\n'.join('  ' + _render_node(f) for f in flds)
+            return 'object\n' + body
+        return 'object'
+
+    if tag in ('i', 'u'):
+        return 'int' if tag == 'i' else 'uint'
+    if tag == 'f':
+        return 'float'
+
+    if tag == 'suf':
+        return _r(ch[0]) if ch else ''
+
+    if tag in ('par', 'conv'):
+        inner = _nonempty(ch)
+        return inner[-1] if inner else ''
+
+    # Unknown tag -> compact raw s-expr fallback.
+    parts = [tag]
+    for c in ch:
+        parts.append(_r(c) if isinstance(c, dict) else _demangle(c))
+    return '(' + ' '.join(p for p in parts if p != '') + ')'
+
+
+def tool_nif_render(args):
+    nif_file = args.get('nif_file')
+    needle = args.get('needle')
+    if not nif_file:
+        return {'error': 'missing required arg: nif_file'}
+    if not os.path.isfile(nif_file):
+        return {'error': 'no such file: %s' % nif_file}
+    try:
+        text = _read_nif(nif_file)
+    except (IOError, OSError) as e:
+        return {'error': str(e)}
+
+    terse = resolve_terse(args)
+    max_lines = 10 if terse else 15
+    forms = nif_parse_forms(text)
+
+    targets = []  # (start, end, tag, name)
+    if needle:
+        needle_l = needle.lower()
+        seen = set()
+        for f in forms:
+            toks = f['tokens']
+            if not toks:
+                continue
+            tag = _base_tag(toks[0])
+            name = _clean_name(toks[1]) if len(toks) > 1 else ''
+            head = ' '.join(toks[:2]).lower()
+            if tag.lower() == needle_l or needle_l in head:
+                key = (f['start'], f['end'])
+                if key in seen:
+                    continue
+                seen.add(key)
+                targets.append((f['start'], f['end'], tag, name))
+    else:
+        # render each top-level node under the stmts container.
+        stmts = None
+        for f in forms:
+            if f['tokens'] and _base_tag(f['tokens'][0]) == 'stmts':
+                stmts = f
+                break
+        if stmts is not None:
+            cd = stmts['depth'] + 1
+            for f in forms:
+                if f['depth'] == cd and f['start'] >= stmts['start'] and \
+                        f['end'] <= stmts['end'] and f['tokens']:
+                    tag = _base_tag(f['tokens'][0])
+                    name = _clean_name(f['tokens'][1]) if len(f['tokens']) > 1 \
+                        else ''
+                    targets.append((f['start'], f['end'], tag, name))
+
+    rendered = []
+    cap = 40
+    for start, end, tag, name in targets[:cap]:
+        node, _ = _nif_build(_nif_tokenize(text[start:end]), 0)
+        pseudo = _truncate_snippet(_render_node(node), max_lines=max_lines,
+                                   max_chars=1500)
+        item = {'tag': tag, 'pseudo_nim': pseudo}
+        if name and not terse:
+            item['name'] = name
+        elif name:
+            item['name'] = name
+        rendered.append(item)
+    return {'rendered': rendered}
+
+
+# --------------------------------------------------------------------------
+# Tool: explain_failure
+# --------------------------------------------------------------------------
+
+def _nimony_culprit(cwd, basename, err_line, err_col, max_lines):
+    """Smallest NIF node spanning (err_line, err_col) in the module's phase
+    artifact, rendered as a raw snippet. Prefers the .s.nif, falls back .p.nif."""
+    nif_path = None
+    for phase in ('s', 'p'):
+        cand = _find_module_nif(cwd, basename, phase)
+        if cand is not None:
+            nif_path = cand
+            break
+    if nif_path is None:
+        return None
+    try:
+        text = _read_nif(nif_path)
+    except (IOError, OSError):
+        return None
+    forms = nif_forms_with_pos(text)
+    best = None  # (span, start, end)
+    for f in forms:
+        src = f.get('src')
+        if not src or src[1] != err_line:
+            continue
+        col = src[2]
+        if col > err_col:
+            continue
+        span = f['end'] - f['start']
+        cand = (err_col - col, span, f['start'], f['end'])
+        if best is None or cand < best:
+            best = cand
+    if best is None:
+        # relax: any form on the error line
+        for f in forms:
+            src = f.get('src')
+            if not src or src[1] != err_line:
+                continue
+            span = f['end'] - f['start']
+            cand = (0, span, f['start'], f['end'])
+            if best is None or cand < best:
+                best = cand
+    if best is None:
+        return None
+    snippet = _truncate_snippet(text[best[2]:best[3]], max_lines=max_lines,
+                                max_chars=1500)
+    return {'artifact': os.path.basename(nif_path), 'snippet': snippet}
+
+
+def _nim_culprit(file_path, err_line, context=3):
+    try:
+        with open(file_path, 'r', errors='replace') as fh:
+            lines = fh.read().splitlines()
+    except (IOError, OSError):
+        return None
+    lo = max(0, err_line - 1 - context)
+    hi = min(len(lines), err_line + context)
+    out = []
+    for idx in range(lo, hi):
+        marker = '>' if (idx + 1) == err_line else ' '
+        out.append('%s %d: %s' % (marker, idx + 1, lines[idx]))
+    return '\n'.join(out)
+
+
+def tool_explain_failure(args):
+    file_path = args.get('file')
+    if not file_path:
+        return {'error': 'missing required arg: file'}
+    toolchain = resolve_toolchain(file_path, args.get('toolchain', 'auto'))
+    terse = resolve_terse(args)
+
+    comp = tool_compile({'file': file_path, 'toolchain': toolchain,
+                         'extra_args': args.get('extra_args'), 'terse': False})
+    if 'error' in comp:
+        return comp
+    diags = comp.get('diagnostics', [])
+    errors = [d for d in diags if d['severity'] == 'Error']
+    ok = comp.get('ok', False)
+
+    if ok or not errors:
+        verdict = 'OK (%s): compiles clean' % toolchain
+        result = {'ok': True, 'toolchain': toolchain, 'verdict': verdict,
+                  'diagnostics': []}
+        return result
+
+    first = errors[0]
+    vlines = ['FAIL (%s): %d error(s)' % (toolchain, len(errors))]
+    for d in errors[:4]:
+        vlines.append(diag_to_str(d))
+    verdict = '\n'.join(vlines[:5])
+
+    culprit = None
+    max_lines = 10 if terse else 15
+    if toolchain == 'nimony':
+        cwd = os.path.dirname(os.path.abspath(file_path)) or '.'
+        culprit = _nimony_culprit(cwd, os.path.basename(file_path),
+                                  first['line'], first['col'], max_lines)
+    else:
+        snippet = _nim_culprit(file_path, first['line'])
+        if snippet is not None:
+            culprit = {'source': snippet}
+
+    if terse:
+        diag_out = [diag_to_str(d) for d in errors]
+    else:
+        diag_out = errors
+    result = {'ok': False, 'toolchain': toolchain, 'verdict': verdict,
+              'diagnostics': diag_out}
+    if culprit is not None:
+        result['culprit'] = culprit
+    return result
+
+
+# --------------------------------------------------------------------------
+# Tool: phase_report
+# --------------------------------------------------------------------------
+
+_PHASE_ORDER = ['p', 's', 'x', 'dce', 'c']
+_PHASE_SKIP = ('deps', 'idx', 'build', 'final')
+
+
+def _phase_summary(path, max_tags=4):
+    try:
+        text = _read_nif(path)
+    except (IOError, OSError) as e:
+        return 'unreadable: %s' % e
+    size = len(text)
+    forms = nif_parse_forms(text)
+    counts = {}
+    for f in forms:
+        if not f['tokens']:
+            continue
+        tag = _base_tag(f['tokens'][0])
+        if not tag or tag.startswith('.'):
+            continue
+        counts[tag] = counts.get(tag, 0) + 1
+    top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:max_tags]
+    tagstr = ', '.join('%s=%d' % (t, c) for t, c in top)
+    return '%d bytes, %d nodes; top: %s' % (size, len(forms), tagstr)
+
+
+def tool_phase_report(args):
+    file_path = args.get('file')
+    if not file_path:
+        return {'error': 'missing required arg: file'}
+    toolchain = resolve_toolchain(file_path, args.get('toolchain', 'auto'))
+
+    comp = tool_compile({'file': file_path, 'toolchain': toolchain,
+                         'extra_args': args.get('extra_args'), 'terse': False})
+    ok = comp.get('ok', False)
+
+    if toolchain != 'nimony':
+        return {'ok': ok, 'phases': [],
+                'note': 'Nim C backend has no NIF phases'}
+
+    cwd = os.path.dirname(os.path.abspath(file_path)) or '.'
+    basename = os.path.basename(file_path)
+    # find the module hash prefix from any phase artifact naming basename.
+    prefix = None
+    for phase in ('p', 's'):
+        cand = _find_module_nif(cwd, basename, phase)
+        if cand is not None:
+            bn = os.path.basename(cand)
+            prefix = bn[:bn.index('.' + phase + '.nif')]
+            break
+
+    phases = []
+    if prefix is not None:
+        ncache = os.path.join(cwd, 'nimcache')
+        found = {}
+        for path in glob.glob(os.path.join(ncache, prefix + '.*.nif')):
+            bn = os.path.basename(path)
+            mid = bn[len(prefix) + 1:-4]  # strip 'prefix.' and '.nif'
+            if '.' in mid:  # multi-segment like s.idx, p.deps
+                continue
+            if mid in _PHASE_SKIP:
+                continue
+            found[mid] = path
+        ordered = [p for p in _PHASE_ORDER if p in found]
+        for p in sorted(found):
+            if p not in ordered:
+                ordered.append(p)
+        for p in ordered:
+            phases.append({'phase': p,
+                           'artifact': os.path.basename(found[p]),
+                           'summary': _phase_summary(found[p])})
+    return {'ok': ok, 'phases': phases}
+
+
+# --------------------------------------------------------------------------
+# Tool: shrink (delta-debug)
+# --------------------------------------------------------------------------
+
+def _compile_first_error(work_dir, tmp_name, content, toolchain):
+    """Write content to work_dir/tmp_name, compile, return first Error message
+    (str) or None if no Error."""
+    tmp_path = os.path.join(work_dir, tmp_name)
+    try:
+        with open(tmp_path, 'w') as fh:
+            fh.write(content)
+    except (IOError, OSError):
+        return None
+    try:
+        if toolchain == 'nimony':
+            cmd = [nimony_bin('nimony'), 'c', tmp_name]
+        else:
+            cmd = [nim_bin('nim'), 'check', '--hints:off', '--colors:off',
+                   tmp_name]
+        rc, out, timed_out = run(cmd, cwd=work_dir, timeout=60)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    for d in parse_diagnostics(out):
+        if d['severity'] == 'Error':
+            return d['message']
+    return None
+
+
+def tool_shrink(args):
+    file_path = args.get('file')
+    if not file_path:
+        return {'error': 'missing required arg: file'}
+    if not os.path.isfile(file_path):
+        return {'error': 'no such file: %s' % file_path}
+    toolchain = resolve_toolchain(file_path, args.get('toolchain', 'auto'))
+    work_dir = os.path.dirname(os.path.abspath(file_path)) or '.'
+    ext = os.path.splitext(file_path)[1] or '.nim'
+    # Must be a valid Nim module identifier (no leading dot): Nim rejects
+    # dotfile module names before it ever type-checks, masking the real error.
+    tmp_name = 'shrink_%d%s' % (os.getpid(), ext)
+
+    try:
+        with open(file_path, 'r', errors='replace') as fh:
+            original = fh.read()
+    except (IOError, OSError) as e:
+        return {'error': str(e)}
+    lines = original.splitlines()
+    orig_count = len(lines)
+
+    target = _compile_first_error(work_dir, tmp_name,
+                                  '\n'.join(lines) + '\n', toolchain)
+    if target is None:
+        return {'error': 'file does not fail with an Error (nothing to shrink)',
+                'toolchain': toolchain, 'original_lines': orig_count}
+
+    # Budget: bound compiles and wall time.
+    max_compiles = 200
+    deadline = time.time() + 90.0
+    compiles = [0]
+
+    def still_fails(cand_lines):
+        if compiles[0] >= max_compiles or time.time() > deadline:
+            return False
+        compiles[0] += 1
+        msg = _compile_first_error(work_dir, tmp_name,
+                                   '\n'.join(cand_lines) + '\n', toolchain)
+        return msg == target
+
+    units = list(lines)
+    # Coarse pass: try dropping shrinking chunk sizes; then fine per-line.
+    chunk = max(1, len(units) // 2)
+    while chunk >= 1:
+        i = 0
+        while i < len(units):
+            if compiles[0] >= max_compiles or time.time() > deadline:
+                break
+            cand = units[:i] + units[i + chunk:]
+            if cand and still_fails(cand):
+                units = cand
+            else:
+                i += chunk
+        if compiles[0] >= max_compiles or time.time() > deadline:
+            break
+        if chunk == 1:
+            break
+        chunk = chunk // 2
+
+    minimal = '\n'.join(units) + '\n' if units else ''
+    return {
+        'toolchain': toolchain,
+        'original_lines': orig_count,
+        'minimal_lines': len(units),
+        'minimal_source': minimal,
+        'kept_error': target,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -652,6 +1465,10 @@ def tool_defs_uses(args):
 TOOLCHAIN_ENUM = {'type': 'string', 'enum': ['auto', 'nim', 'nimony'],
                   'default': 'auto',
                   'description': 'Toolchain: auto-detect (default) or force.'}
+
+TERSE_PROP = {'type': 'boolean',
+              'description': 'Aggressive token-saving output. Defaults to the '
+                             'truthy env var NIMLANG_AGGRESSIVE.'}
 
 TOOLS = [
     {
@@ -665,6 +1482,7 @@ TOOLS = [
                 'toolchain': TOOLCHAIN_ENUM,
                 'extra_args': {'type': 'array', 'items': {'type': 'string'},
                                'description': 'Extra compiler args.'},
+                'terse': TERSE_PROP,
             },
             'required': ['file'],
         },
@@ -679,6 +1497,7 @@ TOOLS = [
             'properties': {
                 'file': {'type': 'string'},
                 'toolchain': TOOLCHAIN_ENUM,
+                'terse': TERSE_PROP,
             },
             'required': ['file'],
         },
@@ -693,6 +1512,7 @@ TOOLS = [
             'properties': {
                 'nif_file': {'type': 'string',
                              'description': 'Path to a .nif file.'},
+                'terse': TERSE_PROP,
             },
             'required': ['nif_file'],
         },
@@ -708,6 +1528,7 @@ TOOLS = [
                 'nif_file': {'type': 'string'},
                 'needle': {'type': 'string',
                            'description': 'Tag or symbol substring to find.'},
+                'terse': TERSE_PROP,
             },
             'required': ['nif_file', 'needle'],
         },
@@ -742,6 +1563,73 @@ TOOLS = [
             'required': ['file', 'line', 'col'],
         },
         'handler': tool_defs_uses,
+    },
+    {
+        'name': 'explain_failure',
+        'description': 'Compile a Nim/Nimony file and, on failure, return a '
+                       'short verdict plus the culprit (Nim: +/-3 source lines; '
+                       'Nimony: smallest NIF node spanning the error). One call '
+                       'replaces compile->list->outline->query.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'file': {'type': 'string'},
+                'toolchain': TOOLCHAIN_ENUM,
+                'extra_args': {'type': 'array', 'items': {'type': 'string'}},
+                'terse': TERSE_PROP,
+            },
+            'required': ['file'],
+        },
+        'handler': tool_explain_failure,
+    },
+    {
+        'name': 'phase_report',
+        'description': 'Compile with Nimony and give a 1-line summary (top tag '
+                       'counts + size) of each nimcache phase artifact (p, s, '
+                       '...), never raw NIF. Nim has no NIF phases.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'file': {'type': 'string'},
+                'toolchain': TOOLCHAIN_ENUM,
+                'extra_args': {'type': 'array', 'items': {'type': 'string'}},
+                'terse': TERSE_PROP,
+            },
+            'required': ['file'],
+        },
+        'handler': tool_phase_report,
+    },
+    {
+        'name': 'nif_render',
+        'description': 'Render matching Nimony NIF node(s) as compact '
+                       'pseudo-Nim (demangled symbols), ~10x smaller than raw '
+                       'NIF. Nimony artifacts only.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'nif_file': {'type': 'string'},
+                'needle': {'type': 'string',
+                           'description': 'Optional tag/symbol substring.'},
+                'terse': TERSE_PROP,
+            },
+            'required': ['nif_file'],
+        },
+        'handler': tool_nif_render,
+    },
+    {
+        'name': 'shrink',
+        'description': 'Delta-debug a failing Nim/Nimony file to a minimal '
+                       'still-failing repro that preserves the first Error.',
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'file': {'type': 'string'},
+                'toolchain': TOOLCHAIN_ENUM,
+                'terse': TERSE_PROP,
+            },
+            'required': ['file'],
+        },
+        'handler': tool_shrink,
     },
 ]
 
